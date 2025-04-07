@@ -12,6 +12,12 @@ import numpy as np
 from tqdm import tqdm
 
 
+class DroppedPeptides(Exception):
+
+    def __init__(self, msg):
+        self.msg = msg
+
+
 def calc_add_n(aa_counts, aa_labeling_dict):
     """
     Convert amino acid counts to the final literature_n value.
@@ -127,32 +133,58 @@ def filter_maxQuant(evidence, samples_as_ref, threshold=10):
     print(f'Keeping only peptides that appear in samples {samples_as_ref}. '
           'Values from these samples will be averaged to form the ID file.')
     evidence_as_ref = evidence[evidence['Experiment'].isin(samples_as_ref)]
-    print('\n\n\n\n\nHELLO WOLRD')
-    print(evidence_as_ref.columns)
 
     # Drop the experiment and raw file columns because it doesn't matter that
-    # they're different and that'll mess up our groupby
-    evidence_as_ref = evidence_as_ref.drop(columns=['Experiment', 'Raw file'])
+    # they're different and that'll mess up our groupby. Also drop Type because
+    # we don't utilize this information, and it varies within the same peptide,
+    # and drop Protein names because the NaN there will cause issues. Also
+    # dropping Gene names because although the examples in my test all have
+    # names, perfectly likely that they don't all
+    evidence_as_ref = evidence_as_ref.drop(columns=[
+        'Experiment', 'Raw file', 'Type', 'Protein names', 'Gene names'
+    ])
+
+    # Also drop columns that only have NaN values
+    evidence_as_ref = evidence_as_ref.dropna(axis=1, how='all')
 
     # Now we group by all columns that have strings, they should be the same
     # for a given peptide and we want to combine on them, also a mean will fail
     # for any column that isn't a number
     group_on = [
-        name for name, dtype in zip(evidence.columns, evidence.dtypes)
+        name
+        for name, dtype in zip(evidence_as_ref.columns, evidence_as_ref.dtypes)
         if dtype == "object"
     ]
 
     # Get the means and stds for all peptide sequences
-    peptide_means = evidence_as_ref.groupby(group_on).agg(['mean', 'std', 'count'])
+    peptide_means = evidence_as_ref.groupby(group_on).agg([
+        'mean', 'std', 'count'
+    ]).fillna(
+        0
+    )  # Same as setting degrees of freedom to 0 for std, does fill some other
+    # NaN in the means, but not in columns we care about
 
     # Check for rows where the std is within our threshold
     evidence_collapsed = peptide_means[
         (peptide_means['Retention time']['count'] > 0)
         & (peptide_means['Retention time']['std'] <= threshold)]
 
+    # Remove the std columns and multiindex to get back the right format of df
+    cols_to_drop = [
+        (c, 'std') for c in evidence_collapsed.columns.levels[0]
+    ] + [(c, 'count') for c in evidence_collapsed.columns.levels[0]]
+    evidence_collapsed = evidence_collapsed.drop(columns=cols_to_drop)
+    evidence_collapsed = evidence_collapsed.droplevel(1, axis=1)
+    evidence_collapsed = evidence_collapsed.reset_index()
+    print(evidence_collapsed.columns)
+
     # If that is not all the peptides, have to deal with problem children
     if len(evidence_collapsed) != len(peptide_means):
-        pass  ## TODO implement
+        raise DroppedPeptides(
+            'One or more peptides have been dropped bceause their standard '
+            'deviations from multiple identifications were too large. '
+            'Implementation needed here to deal with this.'
+        )  ## TODO implement
     else:
         print('All peptide groupings fell inside the provided threshold.')
         return evidence_collapsed
