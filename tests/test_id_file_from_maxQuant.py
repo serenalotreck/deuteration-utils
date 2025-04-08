@@ -26,6 +26,8 @@ def test_filter_maxQuant(evidence_input, evidence_output):
 
     result = filter_maxQuant(evidence_input, ['unlab2', 'unlab3'])
 
+    print(result.dtypes, evidence_output.dtypes)
+    print([c for c in result.columns if c not in evidence_output.columns])
     # We turn ints to floats when we do agg, so ignore dtype
     # We change column order with groupby, so sort to ignore column order
     assert_frame_equal(result.sort_index(axis=1),

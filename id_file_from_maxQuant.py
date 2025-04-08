@@ -18,6 +18,27 @@ class DroppedPeptides(Exception):
         self.msg = msg
 
 
+def extracting_neut(mass):
+    """
+    Determine the value of neutromers_to_extract for a given compound based on the mass.
+
+    Adapted from ID_File_For_Deut_From_Fragpipe_V3.py
+
+    parameters:
+        mass, float: mass of the compound
+
+    returns:
+        neut, int: number of expected neutromers
+    """
+    if mass <= 700:
+        neut = 3
+    elif 701 <= mass <= 1700:
+        neut = 4
+    else:
+        neut = 5
+    return neut
+
+
 def calc_add_n(aa_counts, aa_labeling_dict):
     """
     Convert amino acid counts to the final literature_n value.
@@ -65,13 +86,13 @@ def seq_to_cf(seq):
     """
     Use PyOpenMS to convert the AA sequence to the chemical formula.
     """
-    seq = oms.AASequence.fromString(evidence.loc[0].to_dict()['Sequence'])
+    seq = oms.AASequence.fromString(seq)
     cf = seq.getFormula().toString()
     return cf
 
 
 def evidence_to_deut(evidence, all_deut_col_names, column_mapping,
-                     aa_labeling_dict):
+                     aa_labeling_dict, neutromers_to_extract=None):
     """
     Converts the information available in the evidence.txt output from MaxQuant
     to the column format required by DeuteRater.
@@ -84,6 +105,8 @@ def evidence_to_deut(evidence, all_deut_col_names, column_mapping,
             are the column names for DeuteRater
         aa_labeling_dict, dict: keys are amino acid codes, values are number of
             hydrogens, derived from aa_labeling_sites.tsv
+        neutromers_to_extract, int: number of isotope envelopes to extract. If
+            None (default), uses compund mass to calculate the value
 
     returns:
         deut_table, pandas df: an ID file-formatted df with only the columns
@@ -101,8 +124,11 @@ def evidence_to_deut(evidence, all_deut_col_names, column_mapping,
     # Calculate literature_n and neutromers_to_expect
     deut_table['literature_n'] = deut_table['Sequence'].apply(
         calculate_literature_n, args=(aa_labeling_dict, ))
-    deut_table['neutromers_to_extract'] = deut_table['Observed Mass'].apply(
-        extracting_neut)
+    if neutromers_to_extract == None:
+        deut_table['neutromers_to_extract'] = deut_table['Observed Mass'].apply(
+            extracting_neut)
+    else:
+        deut_table['neutromers_to_extract'] = neutromers_to_extract
 
     # Add all other column names, order them correctly
     missing_cols = [
@@ -114,7 +140,7 @@ def evidence_to_deut(evidence, all_deut_col_names, column_mapping,
     return deut_table
 
 
-def filter_maxQuant(evidence, samples_as_ref, threshold=10):
+def filter_maxQuant(evidence, samples_as_ref, threshold=10, drop_threshold=0.1):
     """
     Collapses rows that represent the same peptide with slightly different
     retention times.
@@ -124,6 +150,8 @@ def filter_maxQuant(evidence, samples_as_ref, threshold=10):
         samples_as_ref, list of str: sample names to use in ID file
         threshold, float: number of seconds that the peptides must elute
             within in order to be considered the same, default is 10 sec
+        drop_threshold, float: proportion between 0 and 1 of peptides that
+            can be above threshold before an exception is raised
 
     returns:
         evidence_collapsed, df: collapsed table
@@ -134,30 +162,32 @@ def filter_maxQuant(evidence, samples_as_ref, threshold=10):
           'Values from these samples will be averaged to form the ID file.')
     evidence_as_ref = evidence[evidence['Experiment'].isin(samples_as_ref)]
 
-    # Drop the experiment and raw file columns because it doesn't matter that
-    # they're different and that'll mess up our groupby. Also drop Type because
-    # we don't utilize this information, and it varies within the same peptide,
-    # and drop Protein names because the NaN there will cause issues. Also
-    # dropping Gene names because although the examples in my test all have
-    # names, perfectly likely that they don't all
+    # Drop the experiment, type and raw file columns because it doesn't matter that
+    # they're different and that'll mess up our groupby, we won't need them again
     evidence_as_ref = evidence_as_ref.drop(columns=[
-        'Experiment', 'Raw file', 'Type', 'Protein names', 'Gene names'
+        'Experiment', 'Raw file', 'Type'
     ])
 
-    # Also drop columns that only have NaN values
+    # Also drop columns that only have NaN values in all rows
     evidence_as_ref = evidence_as_ref.dropna(axis=1, how='all')
 
-    # Now we group by all columns that have strings, they should be the same
-    # for a given peptide and we want to combine on them, also a mean will fail
-    # for any column that isn't a number
-    group_on = [
+    # We also need to get rid of any columns that are type Object but that have
+    # NaN values. Unfortunately, groupby will completely drop groups that have
+    # NaN in any one of the grouping columns. We do need some Protein names back
+    # later, so we'll save that subset of the df and merge it back together later
+    to_drop = [
         name
         for name, dtype in zip(evidence_as_ref.columns, evidence_as_ref.dtypes)
-        if dtype == "object"
+        if dtype == "object" and name not in ['Sequence', 'Leading razor protein']
     ]
+    protein_names_dict = evidence_as_ref[['Sequence', 'Protein names']].set_index('Sequence').to_dict()['Protein names']
+    evidence_as_ref = evidence_as_ref.drop(columns=to_drop)
+    # Frankly, there are some numeric columns that don't make sense to average over samples
+    # (i.e. MS/MS IDs) but that don't really matter in terms of the data I take for the
+    # ID file, so I've just not bothered with them here
 
     # Get the means and stds for all peptide sequences
-    peptide_means = evidence_as_ref.groupby(group_on).agg([
+    peptide_means = evidence_as_ref.groupby(['Sequence', 'Leading razor protein']).agg([
         'mean', 'std', 'count'
     ]).fillna(
         0
@@ -176,15 +206,23 @@ def filter_maxQuant(evidence, samples_as_ref, threshold=10):
     evidence_collapsed = evidence_collapsed.drop(columns=cols_to_drop)
     evidence_collapsed = evidence_collapsed.droplevel(1, axis=1)
     evidence_collapsed = evidence_collapsed.reset_index()
-    print(evidence_collapsed.columns)
+
+    # Add back the protein names
+    evidence_collapsed['Protein names'] = evidence_collapsed['Sequence'].map(protein_names_dict)
 
     # If that is not all the peptides, have to deal with problem children
     if len(evidence_collapsed) != len(peptide_means):
-        raise DroppedPeptides(
-            'One or more peptides have been dropped bceause their standard '
-            'deviations from multiple identifications were too large. '
-            'Implementation needed here to deal with this.'
-        )  ## TODO implement
+        num_missing_peps = len(peptide_means) - len(evidence_collapsed)
+        if num_missing_peps/len(set(evidence_as_ref['Sequence'].tolist())) > drop_threshold:
+            raise DroppedPeptides(
+                f'{num_missing_peps} peptides have been dropped bceause their standard '
+                'deviations from multiple identifications were too large. '
+                'Implementation needed here to deal with this.'
+            )  ## TODO implement
+        else:
+            print(f'{num_missing_peps} peptides have been dropped bceause their standard '
+                'deviations from multiple identifications were too large.')
+            return evidence_collapsed
     else:
         print('All peptide groupings fell inside the provided threshold.')
         return evidence_collapsed
@@ -192,7 +230,7 @@ def filter_maxQuant(evidence, samples_as_ref, threshold=10):
 
 def main(max_quant_evidence, aa_labeling_table, study_type,
          neutromers_to_extract, threshold_to_collapse, samples_as_ref,
-         out_path, out_prefix):
+         out_path, out_prefix, drop_threshold):
 
     # Read in the data and labeling table
     print('\nReading in evidence table and labeling dictionary...')
@@ -205,13 +243,13 @@ def main(max_quant_evidence, aa_labeling_table, study_type,
 
     # Collapse the evidence table
     print('\nCollapsing the evidence table...')
-    evidence = filter_maxQuant(evidence, samples_as_ref, threshold_to_collapse)
+    evidence_collapsed = filter_maxQuant(evidence, samples_as_ref, threshold_to_collapse, drop_threshold)
 
     # Define parameters for DeuteRater
     columns = [
         'Sequence', 'first_accession', 'Protein Name', 'Protein ID',
         'Precursor Retention Time (sec)', 'rt_start', 'rt_end', 'rt_width',
-        'Precursor m/z', 'theoretical_mass', 'Identification Charge', 'ptm',
+        'Precursor m/z', 'Peptide Theoretical Mass', 'Identification Charge', 'ptm',
         'avg_ppm', 'start_loc', 'end_loc', 'num_peptides', 'num_unique',
         'accessions', 'species', 'gene_name', 'protein_existence',
         'sequence_version', 'cf', 'neutromers_to_extract', 'literature_n'
@@ -229,12 +267,12 @@ def main(max_quant_evidence, aa_labeling_table, study_type,
 
     # Call the function
     print('\nCreating the ID file...')
-    deut_table = evidence_to_deut(evidence, all_deut_col_names, column_mapping,
-                                  aa_labeling_dict)
+    deut_table = evidence_to_deut(evidence_collapsed, columns, column_mapping,
+                                  aa_labeling_dict, neutromers_to_extract)
 
     # Save the file
     print('\nSaving output...')
-    save_name = f'{out_loc}/{out_prefix}_deuterater_ID_file.csv'
+    save_name = f'{out_path}/{out_prefix}_deuterater_ID_file.csv'
     deut_table.to_csv(save_name, index=False)
     print(f'Saved output to {save_name}')
 
@@ -263,13 +301,19 @@ if __name__ == '__main__':
         help='String that identifies which row of the aa labeling '
         'table should be used. For the default human table, option '
         'is "tissue"')
+    parser.add_argument('out_path',
+                        type=str,
+                        help='Path to directory to save output')
+    parser.add_argument('out_prefix',
+                        type=str,
+                        help='String to prepend to output file name')
     parser.add_argument(
-        'neutromers_to_extract',
+        '-neutromers_to_extract',
         type=int,
         default=4,
         help='Number of isotope envelopes to consider. Default '
         'is 4')
-    parser.add_argument('threshold_to_collapse',
+    parser.add_argument('-threshold_to_collapse',
                         type=int,
                         default=10,
                         help='Number of seconds to allow different between '
@@ -279,19 +323,18 @@ if __name__ == '__main__':
         nargs='+',
         help='Sample names to use as reference for which proteins '
         'we expect to see in samples')
-    parser.add_argument('out_path',
-                        type=str,
-                        help='Path to directory to save output')
-    parser.add_argument('out_prefix',
-                        type=str,
-                        help='String to prepend to output file name')
+    parser.add_argument('-drop_threshold', type=float, default=0.1,
+                       help='If some peptides don\'t fall within the '
+                       'threshold_to_collapse threshold, the proportion (0 - 1) '
+                       'of the total number of peptides that it\'s okay to '
+                       'drop before raising an exception.')
 
     args = parser.parse_args()
 
-    for a, val in args.items():
+    for a, val in vars(args).items():
         if a in ['max_quant_evidence', 'aa_labeling_table', 'out_path']:
-            args[a] = abspath(v)
+            setattr(args, a, abspath(val)) 
 
     main(args.max_quant_evidence, args.aa_labeling_table, args.study_type,
          args.neutromers_to_extract, args.threshold_to_collapse,
-         args.sampels_as_ref, args.out_path, args.out_prefix)
+         args.samples_as_ref, args.out_path, args.out_prefix, args.drop_threshold)
